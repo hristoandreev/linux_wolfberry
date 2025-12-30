@@ -1,10 +1,13 @@
-name: Build Pi5 kernel .deb + publish APT repo (GitHub Pages)
+name: Pi5/CM5 kernel -> .deb + signed APT repo (GitHub Pages)
 
 on:
   push:
     branches: ["main"]
-    tags: ["v*"]
   workflow_dispatch:
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -12,19 +15,19 @@ permissions:
   id-token: write
 
 jobs:
-  build-and-publish:
+  build:
     runs-on: ubuntu-24.04
     env:
       ARCH: arm64
       CROSS_COMPILE: aarch64-linux-gnu-
-      KERNEL_IMG_NAME: kernel_2712-custom.img
-      PKGNAME: rpi5-kernel-cm5
+      # Файлът, който firmware ще зареди ако добавиш kernel=... в config.txt
+      KERNEL_IMG_NAME: kernel_2712-wolfberry.img
+      # Име на deb пакета
+      PKGNAME: rpi5-kernel-cm5-wolfberry
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
 
       - name: Install build deps
         run: |
@@ -33,19 +36,20 @@ jobs:
             bc bison flex libssl-dev make libc6-dev libncurses5-dev \
             crossbuild-essential-arm64 \
             libelf-dev dwarves \
-            dpkg-dev apt-utils gzip tar
+            dpkg-dev apt-utils gnupg fakeroot gzip xz-utils
 
-      - name: Configure (Pi 5 / CM5) + unique LOCALVERSION
+      - name: Configure (bcm2712) + unique LOCALVERSION
         run: |
           make ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} bcm2712_defconfig
 
-          # За да няма конфликт в /lib/modules – сложи уникален LOCALVERSION
+          # Уникален суфикс, за да не се бие /lib/modules с други kernel-и
           if grep -q '^CONFIG_LOCALVERSION=' .config; then
             sed -i 's/^CONFIG_LOCALVERSION=.*/CONFIG_LOCALVERSION="-cm5-custom"/' .config
           else
             echo 'CONFIG_LOCALVERSION="-cm5-custom"' >> .config
           fi
-          # Да не добавя автоматичен git суфикс
+
+          # Без auto git суфикси (по-стабилно за пакетиране)
           if grep -q '^CONFIG_LOCALVERSION_AUTO=' .config; then
             sed -i 's/^CONFIG_LOCALVERSION_AUTO=.*/CONFIG_LOCALVERSION_AUTO=n/' .config
           else
@@ -60,34 +64,27 @@ jobs:
           KVER="$(make ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} kernelrelease)"
           echo "KVER=${KVER}" >> $GITHUB_ENV
 
-      - name: Build .deb (custom packaging)
+      - name: Build .deb package
         run: |
           VERSION="$(date -u +%Y%m%d%H%M)-g${GITHUB_SHA::7}"
           echo "VERSION=${VERSION}" >> $GITHUB_ENV
 
-          rm -rf buildpkg
-          mkdir -p buildpkg/root/DEBIAN
-          mkdir -p buildpkg/root/usr/lib/${PKGNAME}/${KVER}/dtb
-          mkdir -p buildpkg/root/usr/lib/${PKGNAME}/${KVER}/overlays
+          rm -rf pkg
+          mkdir -p pkg/DEBIAN
+          mkdir -p pkg/usr/lib/${PKGNAME}/${KVER}/dtb
+          mkdir -p pkg/usr/lib/${PKGNAME}/${KVER}/overlays
 
-          # 1) Модули -> директно в /lib/modules/<KVER> вътре в пакета
-          sudo make ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} \
-            INSTALL_MOD_PATH="$PWD/buildpkg/root" modules_install
+          # modules -> /lib/modules/<KVER> (вътре в пакета), с root ownership (fakeroot)
+          fakeroot make ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} \
+            INSTALL_MOD_PATH="$PWD/pkg" modules_install
 
-          # 2) Kernel image (пази го в /usr/lib/... и после postinst го копира в /boot/firmware)
-          install -m 0644 arch/arm64/boot/Image.gz \
-            "buildpkg/root/usr/lib/${PKGNAME}/${KVER}/${KERNEL_IMG_NAME}"
+          # kernel image + dtb/overlays се държат в /usr/lib/... и се копират към /boot/firmware в postinst
+          install -m 0644 arch/arm64/boot/Image.gz pkg/usr/lib/${PKGNAME}/${KVER}/${KERNEL_IMG_NAME}
+          cp arch/arm64/boot/dts/broadcom/*.dtb pkg/usr/lib/${PKGNAME}/${KVER}/dtb/ || true
+          cp arch/arm64/boot/dts/overlays/*.dtb* pkg/usr/lib/${PKGNAME}/${KVER}/overlays/ || true
+          cp arch/arm64/boot/dts/overlays/README pkg/usr/lib/${PKGNAME}/${KVER}/overlays/ || true
 
-          # 3) DTB/overlays (също в /usr/lib/...; postinst ще ги копира в /boot/firmware)
-          cp arch/arm64/boot/dts/broadcom/*.dtb \
-            "buildpkg/root/usr/lib/${PKGNAME}/${KVER}/dtb/" || true
-          cp arch/arm64/boot/dts/overlays/*.dtb* \
-            "buildpkg/root/usr/lib/${PKGNAME}/${KVER}/overlays/" || true
-          cp arch/arm64/boot/dts/overlays/README \
-            "buildpkg/root/usr/lib/${PKGNAME}/${KVER}/overlays/" || true
-
-          # control
-          cat > buildpkg/root/DEBIAN/control <<EOF
+          cat > pkg/DEBIAN/control <<EOF
           Package: ${PKGNAME}
           Version: ${VERSION}
           Section: kernel
@@ -95,12 +92,11 @@ jobs:
           Architecture: arm64
           Maintainer: ${GITHUB_REPOSITORY} <noreply@github.com>
           Depends: libc6
-          Description: Custom Raspberry Pi 5 / CM5 kernel (bcm2712) packaged for Raspberry Pi OS
-           Installs kernel+modules and copies kernel/DTB/overlays to /boot/firmware in postinst.
+          Description: Custom Raspberry Pi 5 / CM5 kernel (bcm2712) for Raspberry Pi OS
+           Installs modules into /lib/modules and copies kernel/dtb/overlays to /boot/firmware in postinst.
           EOF
 
-          # postinst: копира в /boot/firmware, прави backup, depmod за новия KVER
-          cat > buildpkg/root/DEBIAN/postinst <<'EOF'
+          cat > pkg/DEBIAN/postinst <<'EOF'
           #!/bin/sh
           set -e
 
@@ -109,51 +105,81 @@ jobs:
           KERNEL_IMG_NAME="__KERNEL_IMG_NAME__"
           SRC="/usr/lib/${PKGNAME}/${KVER}"
           BOOT="/boot/firmware"
+          [ -d "$BOOT" ] || BOOT="/boot"
 
-          if [ -d "$BOOT" ]; then
-            # backup на стария custom kernel, ако го има
-            if [ -f "${BOOT}/${KERNEL_IMG_NAME}" ]; then
-              cp -f "${BOOT}/${KERNEL_IMG_NAME}" "${BOOT}/${KERNEL_IMG_NAME}.bak" || true
-            fi
+          mkdir -p "${BOOT}/overlays"
 
-            install -m 0644 "${SRC}/${KERNEL_IMG_NAME}" "${BOOT}/${KERNEL_IMG_NAME}"
+          # backup стария custom kernel (ако има)
+          if [ -f "${BOOT}/${KERNEL_IMG_NAME}" ]; then
+            cp -f "${BOOT}/${KERNEL_IMG_NAME}" "${BOOT}/${KERNEL_IMG_NAME}.bak" || true
+          fi
 
-            # DTBs/overlays: копираме (без dpkg ownership конфликти)
-            if [ -d "${SRC}/dtb" ]; then
-              cp -f "${SRC}/dtb/"*.dtb "${BOOT}/" 2>/dev/null || true
-            fi
-            if [ -d "${SRC}/overlays" ]; then
-              mkdir -p "${BOOT}/overlays"
-              cp -f "${SRC}/overlays/"* "${BOOT}/overlays/" 2>/dev/null || true
-            fi
+          install -m 0644 "${SRC}/${KERNEL_IMG_NAME}" "${BOOT}/${KERNEL_IMG_NAME}"
+
+          # dtb + overlays
+          if [ -d "${SRC}/dtb" ]; then
+            cp -f "${SRC}/dtb/"*.dtb "${BOOT}/" 2>/dev/null || true
+          fi
+          if [ -d "${SRC}/overlays" ]; then
+            cp -f "${SRC}/overlays/"* "${BOOT}/overlays/" 2>/dev/null || true
           fi
 
           depmod -a "${KVER}" || true
           exit 0
           EOF
 
-          sed -i "s/__PKGNAME__/${PKGNAME}/g" buildpkg/root/DEBIAN/postinst
-          sed -i "s/__KVER__/${KVER}/g" buildpkg/root/DEBIAN/postinst
-          sed -i "s/__KERNEL_IMG_NAME__/${KERNEL_IMG_NAME}/g" buildpkg/root/DEBIAN/postinst
-          chmod 0755 buildpkg/root/DEBIAN/postinst
+          sed -i "s/__PKGNAME__/${PKGNAME}/g" pkg/DEBIAN/postinst
+          sed -i "s/__KVER__/${KVER}/g" pkg/DEBIAN/postinst
+          sed -i "s/__KERNEL_IMG_NAME__/${KERNEL_IMG_NAME}/g" pkg/DEBIAN/postinst
+          chmod 0755 pkg/DEBIAN/postinst
 
           mkdir -p out
-          dpkg-deb --build buildpkg/root "out/${PKGNAME}_${VERSION}_arm64.deb"
+          dpkg-deb --build pkg "out/${PKGNAME}_${VERSION}_arm64.deb"
           sha256sum "out/${PKGNAME}_${VERSION}_arm64.deb" > "out/${PKGNAME}_${VERSION}_arm64.deb.sha256"
 
-      - name: Build flat APT repo for Pages
+      - name: Import signing key
+        env:
+          APT_GPG_PRIVATE_KEY_ASC: ${{ secrets.APT_GPG_PRIVATE_KEY_ASC }}
+        run: |
+          mkdir -p ~/.gnupg
+          chmod 700 ~/.gnupg
+          echo "$APT_GPG_PRIVATE_KEY_ASC" | gpg --batch --import
+          KEYID="$(gpg --list-secret-keys --with-colons | awk -F: '/^sec/{print $5; exit}')"
+          echo "SIGNING_KEYID=$KEYID" >> $GITHUB_ENV
+          gpg --list-secret-keys --keyid-format=long
+
+      - name: Build signed APT repo (flat) for Pages
+        env:
+          APT_GPG_PASSPHRASE: ${{ secrets.APT_GPG_PASSPHRASE }}
         run: |
           rm -rf public
-          mkdir -p public
-          cp -v out/*.deb public/
+          mkdir -p public/pool
+
+          # пакети
+          cp -v out/*.deb public/pool/
           cp -v out/*.sha256 public/ || true
 
-          cd public
-          dpkg-scanpackages --multiversion . /dev/null > Packages
-          gzip -kf Packages
+          # публикувай и публичния ключ (за клиента)
+          cp -v repo-key.asc public/repo-key.asc
 
-          # По желание: Release файл (полезно е, дори ако ползваш trusted=yes)
+          cd public
+          dpkg-scanpackages pool /dev/null > Packages
+          gzip -9fk Packages
+
+          # Release + подписи (InRelease и Release.gpg)
           apt-ftparchive release . > Release
+
+          gpg --batch --yes --pinentry-mode loopback \
+            --passphrase "$APT_GPG_PASSPHRASE" \
+            --default-key "$SIGNING_KEYID" \
+            --digest-algo SHA256 \
+            --clearsign -o InRelease Release
+
+          gpg --batch --yes --pinentry-mode loopback \
+            --passphrase "$APT_GPG_PASSPHRASE" \
+            --default-key "$SIGNING_KEYID" \
+            --digest-algo SHA256 \
+            -abs -o Release.gpg Release
 
       - name: Configure Pages
         uses: actions/configure-pages@v5
@@ -164,5 +190,8 @@ jobs:
           path: public
 
       - name: Deploy to GitHub Pages
-        id: deploy
+        id: deployment
         uses: actions/deploy-pages@v4
+        environment:
+          name: github-pages
+          url: ${{ steps.deployment.outputs.page_url }}
