@@ -1,20 +1,24 @@
-name: Build Raspberry Pi 5 kernel (bcm2712)
+name: Build Pi5 kernel .deb + publish APT repo (GitHub Pages)
 
 on:
   push:
-    branches: [ "main" ]
-    tags: [ "v*" ]
-  pull_request:
+    branches: ["main"]
+    tags: ["v*"]
   workflow_dispatch:
 
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
 jobs:
-  build:
+  build-and-publish:
     runs-on: ubuntu-24.04
     env:
       ARCH: arm64
       CROSS_COMPILE: aarch64-linux-gnu-
-      # Това е името на kernel файла за Pi 5 според официалната документация
-      KERNEL: kernel_2712
+      KERNEL_IMG_NAME: kernel_2712-custom.img
+      PKGNAME: rpi5-kernel-cm5
 
     steps:
       - name: Checkout
@@ -28,30 +32,20 @@ jobs:
           sudo apt-get install -y \
             bc bison flex libssl-dev make libc6-dev libncurses5-dev \
             crossbuild-essential-arm64 \
-            ccache libelf-dev dwarves
+            libelf-dev dwarves \
+            dpkg-dev apt-utils gzip tar
 
-      - name: Cache ccache
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/ccache
-          key: ccache-${{ runner.os }}-${{ env.ARCH }}-${{ github.ref_name }}-${{ github.sha }}
-          restore-keys: |
-            ccache-${{ runner.os }}-${{ env.ARCH }}-${{ github.ref_name }}-
-            ccache-${{ runner.os }}-${{ env.ARCH }}-
-
-      - name: Configure (Pi 5 / CM5)
+      - name: Configure (Pi 5 / CM5) + unique LOCALVERSION
         run: |
           make ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} bcm2712_defconfig
 
-          # Добра практика: уникален LOCALVERSION, за да не се препокриват /lib/modules
-          # (официалната документация препоръчва това)
+          # За да няма конфликт в /lib/modules – сложи уникален LOCALVERSION
           if grep -q '^CONFIG_LOCALVERSION=' .config; then
             sed -i 's/^CONFIG_LOCALVERSION=.*/CONFIG_LOCALVERSION="-cm5-custom"/' .config
           else
             echo 'CONFIG_LOCALVERSION="-cm5-custom"' >> .config
           fi
-
-          # По желание: да не добавя автоматични git суфикси
+          # Да не добавя автоматичен git суфикс
           if grep -q '^CONFIG_LOCALVERSION_AUTO=' .config; then
             sed -i 's/^CONFIG_LOCALVERSION_AUTO=.*/CONFIG_LOCALVERSION_AUTO=n/' .config
           else
@@ -60,43 +54,115 @@ jobs:
 
           make ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} olddefconfig
 
-      - name: Build
+      - name: Build kernel + modules + dtbs
         run: |
-          export CC="ccache ${CROSS_COMPILE}gcc"
-          ccache -M 2G
           make -j"$(nproc)" ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} Image.gz modules dtbs
+          KVER="$(make ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} kernelrelease)"
+          echo "KVER=${KVER}" >> $GITHUB_ENV
 
-      - name: Stage files into a rootfs-style tarball
+      - name: Build .deb (custom packaging)
         run: |
-          rm -rf stage
-          mkdir -p stage/boot/firmware/overlays
+          VERSION="$(date -u +%Y%m%d%H%M)-g${GITHUB_SHA::7}"
+          echo "VERSION=${VERSION}" >> $GITHUB_ENV
 
-          # Инсталирай модулите така, че да отидат в stage/lib/modules/...
+          rm -rf buildpkg
+          mkdir -p buildpkg/root/DEBIAN
+          mkdir -p buildpkg/root/usr/lib/${PKGNAME}/${KVER}/dtb
+          mkdir -p buildpkg/root/usr/lib/${PKGNAME}/${KVER}/overlays
+
+          # 1) Модули -> директно в /lib/modules/<KVER> вътре в пакета
           sudo make ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} \
-            INSTALL_MOD_PATH="$PWD/stage" modules_install
+            INSTALL_MOD_PATH="$PWD/buildpkg/root" modules_install
 
-          # Kernel + DTBs + overlays — по официалните стъпки за Raspberry Pi OS
-          cp arch/arm64/boot/Image.gz "stage/boot/firmware/${KERNEL}.img"
-          cp arch/arm64/boot/dts/broadcom/*.dtb stage/boot/firmware/
-          cp arch/arm64/boot/dts/overlays/*.dtb* stage/boot/firmware/overlays/
-          cp arch/arm64/boot/dts/overlays/README stage/boot/firmware/overlays/
+          # 2) Kernel image (пази го в /usr/lib/... и после postinst го копира в /boot/firmware)
+          install -m 0644 arch/arm64/boot/Image.gz \
+            "buildpkg/root/usr/lib/${PKGNAME}/${KVER}/${KERNEL_IMG_NAME}"
 
-          TAR="${KERNEL}-${GITHUB_SHA::7}.tar.gz"
-          (cd stage && tar -czf "../${TAR}" .)
-          sha256sum "${TAR}" > "${TAR}.sha256"
+          # 3) DTB/overlays (също в /usr/lib/...; postinst ще ги копира в /boot/firmware)
+          cp arch/arm64/boot/dts/broadcom/*.dtb \
+            "buildpkg/root/usr/lib/${PKGNAME}/${KVER}/dtb/" || true
+          cp arch/arm64/boot/dts/overlays/*.dtb* \
+            "buildpkg/root/usr/lib/${PKGNAME}/${KVER}/overlays/" || true
+          cp arch/arm64/boot/dts/overlays/README \
+            "buildpkg/root/usr/lib/${PKGNAME}/${KVER}/overlays/" || true
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+          # control
+          cat > buildpkg/root/DEBIAN/control <<EOF
+          Package: ${PKGNAME}
+          Version: ${VERSION}
+          Section: kernel
+          Priority: optional
+          Architecture: arm64
+          Maintainer: ${GITHUB_REPOSITORY} <noreply@github.com>
+          Depends: libc6
+          Description: Custom Raspberry Pi 5 / CM5 kernel (bcm2712) packaged for Raspberry Pi OS
+           Installs kernel+modules and copies kernel/DTB/overlays to /boot/firmware in postinst.
+          EOF
+
+          # postinst: копира в /boot/firmware, прави backup, depmod за новия KVER
+          cat > buildpkg/root/DEBIAN/postinst <<'EOF'
+          #!/bin/sh
+          set -e
+
+          PKGNAME="__PKGNAME__"
+          KVER="__KVER__"
+          KERNEL_IMG_NAME="__KERNEL_IMG_NAME__"
+          SRC="/usr/lib/${PKGNAME}/${KVER}"
+          BOOT="/boot/firmware"
+
+          if [ -d "$BOOT" ]; then
+            # backup на стария custom kernel, ако го има
+            if [ -f "${BOOT}/${KERNEL_IMG_NAME}" ]; then
+              cp -f "${BOOT}/${KERNEL_IMG_NAME}" "${BOOT}/${KERNEL_IMG_NAME}.bak" || true
+            fi
+
+            install -m 0644 "${SRC}/${KERNEL_IMG_NAME}" "${BOOT}/${KERNEL_IMG_NAME}"
+
+            # DTBs/overlays: копираме (без dpkg ownership конфликти)
+            if [ -d "${SRC}/dtb" ]; then
+              cp -f "${SRC}/dtb/"*.dtb "${BOOT}/" 2>/dev/null || true
+            fi
+            if [ -d "${SRC}/overlays" ]; then
+              mkdir -p "${BOOT}/overlays"
+              cp -f "${SRC}/overlays/"* "${BOOT}/overlays/" 2>/dev/null || true
+            fi
+          fi
+
+          depmod -a "${KVER}" || true
+          exit 0
+          EOF
+
+          sed -i "s/__PKGNAME__/${PKGNAME}/g" buildpkg/root/DEBIAN/postinst
+          sed -i "s/__KVER__/${KVER}/g" buildpkg/root/DEBIAN/postinst
+          sed -i "s/__KERNEL_IMG_NAME__/${KERNEL_IMG_NAME}/g" buildpkg/root/DEBIAN/postinst
+          chmod 0755 buildpkg/root/DEBIAN/postinst
+
+          mkdir -p out
+          dpkg-deb --build buildpkg/root "out/${PKGNAME}_${VERSION}_arm64.deb"
+          sha256sum "out/${PKGNAME}_${VERSION}_arm64.deb" > "out/${PKGNAME}_${VERSION}_arm64.deb.sha256"
+
+      - name: Build flat APT repo for Pages
+        run: |
+          rm -rf public
+          mkdir -p public
+          cp -v out/*.deb public/
+          cp -v out/*.sha256 public/ || true
+
+          cd public
+          dpkg-scanpackages --multiversion . /dev/null > Packages
+          gzip -kf Packages
+
+          # По желание: Release файл (полезно е, дори ако ползваш trusted=yes)
+          apt-ftparchive release . > Release
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
         with:
-          name: rpi5-kernel-${{ env.KERNEL }}-${{ github.sha }}
-          path: |
-            ${{ env.KERNEL }}-*.tar.gz
-            ${{ env.KERNEL }}-*.tar.gz.sha256
+          path: public
 
-      - name: Create GitHub Release (tags only)
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            ${{ env.KERNEL }}-*.tar.gz
-            ${{ env.KERNEL }}-*.tar.gz.sha256
+      - name: Deploy to GitHub Pages
+        id: deploy
+        uses: actions/deploy-pages@v4
