@@ -140,14 +140,26 @@ jobs:
           dpkg-deb --build pkg "out/${PKGNAME}_${VERSION}_arm64.deb"
           sha256sum "out/${PKGNAME}_${VERSION}_arm64.deb" > "out/${PKGNAME}_${VERSION}_arm64.deb.sha256"
 
-      - name: Import signing key
+      - name: Import signing key (base64)
         env:
-          APT_GPG_PRIVATE_KEY_ASC: ${{ secrets.APT_GPG_PRIVATE_KEY_ASC }}
+          APT_GPG_PRIVATE_KEY_B64: ${{ secrets.APT_GPG_PRIVATE_KEY_B64 }}
         run: |
           mkdir -p ~/.gnupg
           chmod 700 ~/.gnupg
-          echo "$APT_GPG_PRIVATE_KEY_ASC" | gpg --batch --import
+
+          # fail fast ако secret липсва
+          if [ -z "$APT_GPG_PRIVATE_KEY_B64" ]; then
+            echo "ERROR: Secret APT_GPG_PRIVATE_KEY_B64 is empty/missing."
+            exit 1
+          fi
+
+          printf '%s' "$APT_GPG_PRIVATE_KEY_B64" | base64 -d | gpg --batch --import
+
           KEYID="$(gpg --list-secret-keys --with-colons | awk -F: '/^sec/{print $5; exit}')"
+          if [ -z "$KEYID" ]; then
+            echo "ERROR: No secret key imported (did you export *secret* keys?)."
+            exit 1
+          fi
           echo "SIGNING_KEYID=$KEYID" >> $GITHUB_ENV
           gpg --list-secret-keys --keyid-format=long
 
