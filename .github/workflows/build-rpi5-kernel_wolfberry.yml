@@ -18,7 +18,7 @@ jobs:
   build:
     runs-on: ubuntu-24.04
     environment:
-      name: github-pages
+      name: linux-wolfberry
       url: ${{ steps.deployment.outputs.page_url }}
     env:
       ARCH: arm64
