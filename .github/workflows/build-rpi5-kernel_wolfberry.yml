@@ -93,7 +93,7 @@ jobs:
           Section: kernel
           Priority: optional
           Architecture: arm64
-          Maintainer: ${GITHUB_REPOSITORY} <noreply@github.com>
+          Maintainer: ${GITHUB_REPOSITORY} <hristoandreev@wolfberry.lz1haa.eu>
           Depends: libc6
           Description: Custom Raspberry Pi 5 / CM5 kernel (bcm2712) for Raspberry Pi OS
            Installs modules into /lib/modules and copies kernel/dtb/overlays to /boot/firmware in postinst.
