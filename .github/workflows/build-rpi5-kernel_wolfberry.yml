@@ -175,7 +175,7 @@ jobs:
           cp -v out/*.sha256 public/ || true
 
           # публикувай и публичния ключ (за клиента)
-          cp -v cm5-wolfberry-kernel-repo.asc public/cm5-wolfberry-kernel-repo.asc
+          # cp -v cm5-wolfberry-kernel-repo.asc public/cm5-wolfberry-kernel-repo.asc
 
           cd public
           dpkg-scanpackages pool /dev/null > Packages
