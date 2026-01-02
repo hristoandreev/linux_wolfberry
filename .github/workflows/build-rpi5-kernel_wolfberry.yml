@@ -47,9 +47,9 @@ jobs:
 
           # Уникален суфикс, за да не се бие /lib/modules с други kernel-и
           if grep -q '^CONFIG_LOCALVERSION=' .config; then
-            sed -i 's/^CONFIG_LOCALVERSION=.*/CONFIG_LOCALVERSION="-cm5-custom"/' .config
+            sed -i 's/^CONFIG_LOCALVERSION=.*/CONFIG_LOCALVERSION="-wolfberry"/' .config
           else
-            echo 'CONFIG_LOCALVERSION="-cm5-custom"' >> .config
+            echo 'CONFIG_LOCALVERSION="-wolfberry"' >> .config
           fi
 
           # Без auto git суфикси (по-стабилно за пакетиране)
