@@ -1,58 +1,45 @@
-name: Pi5/CM5 kernel -> .deb + signed APT repo (GitHub Pages)
+name: Build RPi5/CM5 kernel (.deb) for Wolfberry APT (suite-agnostic)
 
 on:
   push:
     branches: ["main"]
   workflow_dispatch:
 
-concurrency:
-  group: pages
-  cancel-in-progress: true
-
 permissions:
   contents: read
-  pages: write
-  id-token: write
 
 jobs:
-  build:
+  build-kernel-deb:
     runs-on: ubuntu-24.04
-    environment:
-      name: linux-wolfberry
-      url: ${{ steps.deployment.outputs.page_url }}
+
     env:
       ARCH: arm64
       CROSS_COMPILE: aarch64-linux-gnu-
-      # Файлът, който firmware ще зареди ако добавиш kernel=... в config.txt
       KERNEL_IMG_NAME: kernel_2712-wolfberry.img
-      # Име на deb пакета
       PKGNAME: rpi5-kernel-cm5-wolfberry
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install build deps
+      - name: Install build deps (cross compile)
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
-            bc bison flex libssl-dev make libc6-dev libncurses5-dev \
-            crossbuild-essential-arm64 \
-            libelf-dev dwarves \
-            dpkg-dev apt-utils gnupg fakeroot gzip xz-utils
+          sudo apt-get install -y --no-install-recommends             bc bison flex make             libssl-dev libc6-dev libncurses-dev             libelf-dev dwarves             crossbuild-essential-arm64             dpkg-dev fakeroot gzip xz-utils             ca-certificates
 
-      - name: Configure (bcm2712) + unique LOCALVERSION
+      - name: Configure (bcm2712) + LOCALVERSION
         run: |
+          set -e
           make ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} bcm2712_defconfig
 
-          # Уникален суфикс, за да не се бие /lib/modules с други kernel-и
+          # уникален суфикс, за да не се бие /lib/modules с други kernel-и
           if grep -q '^CONFIG_LOCALVERSION=' .config; then
             sed -i 's/^CONFIG_LOCALVERSION=.*/CONFIG_LOCALVERSION="-wolfberry"/' .config
           else
             echo 'CONFIG_LOCALVERSION="-wolfberry"' >> .config
           fi
 
-          # Без auto git суфикси (по-стабилно за пакетиране)
+          # без auto git суфикси (по-стабилно за пакетиране)
           if grep -q '^CONFIG_LOCALVERSION_AUTO=' .config; then
             sed -i 's/^CONFIG_LOCALVERSION_AUTO=.*/CONFIG_LOCALVERSION_AUTO=n/' .config
           else
@@ -63,29 +50,32 @@ jobs:
 
       - name: Build kernel + modules + dtbs
         run: |
+          set -e
           make -j"$(nproc)" ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} Image.gz modules dtbs
           KVER="$(make ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} kernelrelease)"
-          echo "KVER=${KVER}" >> $GITHUB_ENV
+          echo "KVER=${KVER}" >> "$GITHUB_ENV"
+          echo "Kernel release: ${KVER}"
 
-      - name: Build .deb package
+      - name: Build .deb package (kernel + modules + dtb/overlays)
         run: |
-          VERSION="$(date -u +%Y%m%d%H%M)-g${GITHUB_SHA::7}"
-          echo "VERSION=${VERSION}" >> $GITHUB_ENV
+          set -e
+          SHORT_SHA="$(printf '%s' "$GITHUB_SHA" | cut -c1-7)"
+          VERSION="$(date -u +%Y%m%d%H%M)-g${SHORT_SHA}"
+          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
 
-          rm -rf pkg
+          rm -rf pkg out
           mkdir -p pkg/DEBIAN
-          mkdir -p pkg/usr/lib/${PKGNAME}/${KVER}/dtb
-          mkdir -p pkg/usr/lib/${PKGNAME}/${KVER}/overlays
+          mkdir -p "pkg/usr/lib/${PKGNAME}/${KVER}/dtb"
+          mkdir -p "pkg/usr/lib/${PKGNAME}/${KVER}/overlays"
 
-          # modules -> /lib/modules/<KVER> (вътре в пакета), с root ownership (fakeroot)
-          fakeroot make ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} \
-            INSTALL_MOD_PATH="$PWD/pkg" modules_install
+          # modules -> /lib/modules/<KVER> (вътре в пакета)
+          fakeroot make ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE}             INSTALL_MOD_PATH="$PWD/pkg" modules_install
 
           # kernel image + dtb/overlays се държат в /usr/lib/... и се копират към /boot/firmware в postinst
-          install -m 0644 arch/arm64/boot/Image.gz pkg/usr/lib/${PKGNAME}/${KVER}/${KERNEL_IMG_NAME}
-          cp arch/arm64/boot/dts/broadcom/*.dtb pkg/usr/lib/${PKGNAME}/${KVER}/dtb/ || true
-          cp arch/arm64/boot/dts/overlays/*.dtb* pkg/usr/lib/${PKGNAME}/${KVER}/overlays/ || true
-          cp arch/arm64/boot/dts/overlays/README pkg/usr/lib/${PKGNAME}/${KVER}/overlays/ || true
+          install -m 0644 arch/arm64/boot/Image.gz "pkg/usr/lib/${PKGNAME}/${KVER}/${KERNEL_IMG_NAME}"
+          cp arch/arm64/boot/dts/broadcom/*.dtb "pkg/usr/lib/${PKGNAME}/${KVER}/dtb/" 2>/dev/null || true
+          cp arch/arm64/boot/dts/overlays/*.dtb* "pkg/usr/lib/${PKGNAME}/${KVER}/overlays/" 2>/dev/null || true
+          cp arch/arm64/boot/dts/overlays/README "pkg/usr/lib/${PKGNAME}/${KVER}/overlays/" 2>/dev/null || true
 
           cat > pkg/DEBIAN/control <<EOF
           Package: ${PKGNAME}
@@ -106,6 +96,7 @@ jobs:
           PKGNAME="__PKGNAME__"
           KVER="__KVER__"
           KERNEL_IMG_NAME="__KERNEL_IMG_NAME__"
+
           SRC="/usr/lib/${PKGNAME}/${KVER}"
           BOOT="/boot/firmware"
           [ -d "$BOOT" ] || BOOT="/boot"
@@ -140,70 +131,28 @@ jobs:
           dpkg-deb --build pkg "out/${PKGNAME}_${VERSION}_arm64.deb"
           sha256sum "out/${PKGNAME}_${VERSION}_arm64.deb" > "out/${PKGNAME}_${VERSION}_arm64.deb.sha256"
 
-      - name: Import signing key (base64)
-        env:
-          APT_GPG_PRIVATE_KEY_B64: ${{ secrets.APT_GPG_PRIVATE_KEY_B64 }}
+      - name: Inspect produced .deb
         run: |
-          mkdir -p ~/.gnupg
-          chmod 700 ~/.gnupg
+          set -e
+          ls -lah out
+          DEB="$(ls -1 out/*.deb | head -n1)"
+          echo "DEB: $DEB"
+          dpkg-deb -I "$DEB" | sed -n '1,160p'
+          dpkg-deb -c "$DEB" | sed -n '1,120p'
 
-          # fail fast ако secret липсва
-          if [ -z "$APT_GPG_PRIVATE_KEY_B64" ]; then
-            echo "ERROR: Secret APT_GPG_PRIVATE_KEY_B64 is empty/missing."
-            exit 1
-          fi
-
-          printf '%s' "$APT_GPG_PRIVATE_KEY_B64" | base64 -d | gpg --batch --import
-
-          KEYID="$(gpg --list-secret-keys --with-colons | awk -F: '/^sec/{print $5; exit}')"
-          if [ -z "$KEYID" ]; then
-            echo "ERROR: No secret key imported (did you export *secret* keys?)."
-            exit 1
-          fi
-          echo "SIGNING_KEYID=$KEYID" >> $GITHUB_ENV
-          gpg --list-secret-keys --keyid-format=long
-
-      - name: Build signed APT repo (flat) for Pages
-        env:
-          APT_GPG_PASSPHRASE: ${{ secrets.APT_GPG_PASSPHRASE }}
+      - name: Prepare artifact payload (common/)
         run: |
-          rm -rf public
-          mkdir -p public/pool
+          set -e
+          rm -rf common
+          mkdir -p common
+          cp -v out/*.deb common/
+          cp -v out/*.sha256 common/ || true
+          ls -lah common
 
-          # пакети
-          cp -v out/*.deb public/pool/
-          cp -v out/*.sha256 public/ || true
-
-          # публикувай и публичния ключ (за клиента)
-          # cp -v cm5-wolfberry-kernel-repo.asc public/cm5-wolfberry-kernel-repo.asc
-
-          cd public
-          dpkg-scanpackages pool /dev/null > Packages
-          gzip -9fk Packages
-
-          # Release + подписи (InRelease и Release.gpg)
-          apt-ftparchive release . > Release
-
-          gpg --batch --yes --pinentry-mode loopback \
-            --passphrase "$APT_GPG_PASSPHRASE" \
-            --default-key "$SIGNING_KEYID" \
-            --digest-algo SHA256 \
-            --clearsign -o InRelease Release
-
-          gpg --batch --yes --pinentry-mode loopback \
-            --passphrase "$APT_GPG_PASSPHRASE" \
-            --default-key "$SIGNING_KEYID" \
-            --digest-algo SHA256 \
-            -abs -o Release.gpg Release
-
-      - name: Configure Pages
-        uses: actions/configure-pages@v5
-
-      - name: Upload Pages artifact
-        uses: actions/upload-pages-artifact@v3
+      - name: Upload artifact (common for ALL suites)
+        uses: actions/upload-artifact@v4
         with:
-          path: public
-
-      - name: Deploy to GitHub Pages
-        id: deployment
-        uses: actions/deploy-pages@v4
+          name: apt-common-${{ env.ARCH }}
+          path: common/
+          if-no-files-found: error
+          retention-days: 30
