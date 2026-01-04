@@ -32,20 +32,21 @@ jobs:
           set -e
           make ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} bcm2712_defconfig
 
-          # уникален суфикс, за да не се бие /lib/modules с други kernel-и
+          # Pi-style uname -r suffix:
+          # 6.12.62 + "+wolfberry-rpi-2712"  => 6.12.62+wolfberry-rpi-2712
           if grep -q '^CONFIG_LOCALVERSION=' .config; then
-            sed -i 's/^CONFIG_LOCALVERSION=.*/CONFIG_LOCALVERSION="-wolfberry"/' .config
+            sed -i 's/^CONFIG_LOCALVERSION=.*/CONFIG_LOCALVERSION="+wolfberry-rpi-2712"/' .config
           else
-            echo 'CONFIG_LOCALVERSION="-wolfberry"' >> .config
+            echo 'CONFIG_LOCALVERSION="+wolfberry-rpi-2712"' >> .config
           fi
-
-          # без auto git суфикси (по-стабилно за пакетиране)
+          
+          # Disable automatic git/dirty suffixes (removes trailing "+")
           if grep -q '^CONFIG_LOCALVERSION_AUTO=' .config; then
             sed -i 's/^CONFIG_LOCALVERSION_AUTO=.*/CONFIG_LOCALVERSION_AUTO=n/' .config
           else
             echo 'CONFIG_LOCALVERSION_AUTO=n' >> .config
           fi
-
+          
           make ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} olddefconfig
 
       - name: Build kernel + modules + dtbs
