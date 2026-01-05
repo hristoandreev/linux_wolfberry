@@ -16,7 +16,7 @@ jobs:
       ARCH: arm64
       CROSS_COMPILE: aarch64-linux-gnu-
       KERNEL_IMG_NAME: kernel_2712_wolfberry.img
-      PKGNAME: kernel_2712_wolfberry
+      PKGNAME: kernel-2712-wolfberry
 
     steps:
       - name: Checkout
